@@ -2,23 +2,40 @@
   "project": "my-mac-service",
   "pull": [
     {
-      "src": "~/.my-service",
-      "dest": "my-service",
-      "exclude": ["bin", "logs", "backups", "*.db", "*.log", "config.json"]
+      "src": "~/.config/my-mac-service",
+      "dest": "config",
+      "exclude": [
+        ".git",
+        "node_modules",
+        ".env",
+        ".env.*",
+        "*.key",
+        "*.pem",
+        "*.p12",
+        "*.dmg",
+        "*.zip",
+        "*.tar.gz",
+        "*.sqlite*",
+        ".DS_Store"
+      ]
     }
   ],
   "logs": [
-    { "path": "~/.my-service/logs/app.log", "lines": 100 }
+    {
+      "path": "~/Library/Logs/my-mac-service.log",
+      "lines": 200
+    }
   ],
-  "deploy_cmd": "bash ./deploy.sh",
-  "rollback_cmd": "bash ./rollback.sh",
-  "backup_dir": "~/.my-service/backups",
+  "deploy_cmd": "echo '[deploy] 请在 .ops.json 中配置实际 deploy_cmd'",
+  "rollback_cmd": "echo '[rollback] 请在 .ops.json 中配置实际 rollback_cmd'",
+  "backup_dir": "./backups",
   "keep_backups": 3,
-  "capture_app": "Terminal",
+  "capture_app": "",
   "agy_app": "Antigravity",
   "agy_idle_seconds": 15,
   "agy_focus_key": "l",
   "verify_cmds": [
-    "echo 'Service health check OK'"
+    "uname -a",
+    "date"
   ]
 }

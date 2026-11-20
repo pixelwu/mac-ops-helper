@@ -1,23 +1,13 @@
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-Icon
-
-# ops-helper runtime & sync directories
+# 同步产物与本地备份
 .sync/
-.ops.json
-config.json
 backups/
 
-# Logs & temp files
-*.log
-*.tmp
-*.swp
-*~
+# macOS 系统与远程挂载卷元数据文件
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
 
-# IDE & editors
-.idea/
-.vscode/
-*.sublime-project
-*.sublime-workspace
+# 本地构建与日志产物
+*.log
+*.app/
