@@ -1,422 +1,454 @@
 import Cocoa
 import Foundation
 
-enum DaemonState: Equatable {
-    case running(projectCount: Int, heartbeatAge: Int)
-    case paused(projectCount: Int, heartbeatAge: Int)
-    case stopped(projectCount: Int)
-    case failed(reason: String, projectCount: Int)
-
-    var isFailed: Bool {
-        if case .failed = self { return true }
-        return false
-    }
+struct PresenceStatus: Decodable {
+    let declared_mode: String
+    let effective_mode: String
+    let effective_plan: String
+    let idle_seconds: Int
+    let online_fallback_seconds: Int
+    let away_grace_seconds: Int
+    let auto_idle_seconds: Int
+    let reason: String
+    let last_transition: String
+    let handoff_requested: Bool
+    let daemon_status: String
+    let heartbeat_age: Int
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private var statusItem: NSStatusItem!
-    private let menu = NSMenu()
+final class OpsMenuBarController: NSObject, NSMenuDelegate {
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var pollTimer: Timer?
-    private let workQueue = DispatchQueue(label: "com.user.ops-menubar.worker", qos: .utility)
+    private var currentStatus: PresenceStatus?
+    private var lastDaemonStatus: String = "UNKNOWN"
+    private var lastWakeTime: Date = Date.distantPast
+    private let opsBin: String = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.local/bin/ops"
+    }()
+    private let daemonLogPath: String = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(home)/.local/state/ops/watch-daemon.log"
+    }()
 
-    private var currentState: DaemonState = .stopped(projectCount: 0)
-    private var currentProjects: [String] = []
-    private var graceUntil: Date = Date().addingTimeInterval(10)
-    private var hasNotifiedFailure: Bool = false
-    private var isPolling: Bool = false
+    override init() {
+        super.init()
+        setupStatusItem()
+        observeWakeNotifications()
+        refreshStatus()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.refreshStatus()
+        }
+    }
 
-    private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-    private let daemonLabel = "com.user.ops-watch"
-    private let heartbeatTimeoutSec = 15
-
-    private var opsBinPath: String { "\(homeDir)/.local/bin/ops" }
-    private var stateDir: String { "\(homeDir)/.local/state/ops" }
-    private var heartbeatFile: String { "\(stateDir)/heartbeat" }
-    private var pausedFile: String { "\(stateDir)/paused" }
-    private var stoppedFile: String { "\(stateDir)/stopped_by_user" }
-    private var logFile: String { "\(stateDir)/watch-daemon.log" }
-    private var projectsFile: String { "\(homeDir)/.ops-watch-projects" }
-    private var domainTarget: String { "gui/\(getuid())/\(daemonLabel)" }
-
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private func setupStatusItem() {
+        if let button = statusItem.button {
+            button.imagePosition = .imageLeading
+            button.title = " ops"
+            button.image = NSImage(systemSymbolName: "bolt.circle", accessibilityDescription: "ops")
+        }
+        let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+    }
 
+    private func observeWakeNotifications() {
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
             selector: #selector(handleSystemWake),
             name: NSWorkspace.didWakeNotification,
             object: nil
         )
-
-        updateStatusIcon(for: currentState, inGracePeriod: true)
-        pollStatus()
-
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.pollStatus()
-        }
-        RunLoop.main.add(pollTimer!, forMode: .common)
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        pollTimer?.invalidate()
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     @objc private func handleSystemWake() {
-        graceUntil = Date().addingTimeInterval(10)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.pollStatus()
+        lastWakeTime = Date()
+    }
+
+    private func runOps(_ args: [String], completion: ((Int32, String) -> Void)? = nil) {
+        DispatchQueue.global(qos: .userInitiated).async { [opsBin] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [opsBin] + args
+
+            var env = ProcessInfo.processInfo.environment
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            env["HOME"] = home
+            env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            process.environment = env
+
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            do {
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let out = String(data: data, encoding: .utf8) ?? ""
+                DispatchQueue.main.async {
+                    completion?(process.terminationStatus, out)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion?(-1, error.localizedDescription)
+                }
+            }
         }
     }
 
-    // MARK: - Polling & State Detection
-
-    private func pollStatus() {
-        guard !isPolling else { return }
-        isPolling = true
-
-        workQueue.async { [weak self] in
+    private func refreshStatus() {
+        runOps(["presence", "status", "--json"]) { [weak self] code, output in
             guard let self = self else { return }
-            let projects = self.readProjects()
-            let state = self.detectDaemonState(projectCount: projects.count)
-
-            DispatchQueue.main.async {
-                self.isPolling = false
-                self.currentProjects = projects
-                self.applyNewState(state)
+            guard code == 0, let data = output.data(using: .utf8),
+                  let parsed = try? JSONDecoder().decode(PresenceStatus.self, from: data) else {
+                self.updateButtonOffline()
+                return
             }
+
+            // 休眠唤醒后 10 秒内防误报
+            let inWakeGrace = Date().timeIntervalSince(self.lastWakeTime) < 10.0
+            if !inWakeGrace && parsed.daemon_status == "FAILED" && self.lastDaemonStatus != "FAILED" {
+                self.sendAlertNotification(
+                    title: "ops 后台守护异常",
+                    body: "检测到 ops daemon 未运行或心跳超时，请点击顶栏图标一键恢复。"
+                )
+            }
+            self.lastDaemonStatus = parsed.daemon_status
+            self.currentStatus = parsed
+            self.updateButton(with: parsed)
         }
     }
 
-    private func detectDaemonState(projectCount: Int) -> DaemonState {
-        let launchdRunning = isLaunchdRunning()
-        let fm = FileManager.default
-        let isPaused = fm.fileExists(atPath: pausedFile)
-        let isStoppedByUser = fm.fileExists(atPath: stoppedFile)
-        let heartbeatAge = readHeartbeatAge()
-
-        if launchdRunning {
-            guard let age = heartbeatAge else {
-                return .failed(reason: "暂无心跳记录", projectCount: projectCount)
-            }
-            if age > heartbeatTimeoutSec {
-                return .failed(reason: "心跳超时 \(age)s", projectCount: projectCount)
-            }
-            if isPaused {
-                return .paused(projectCount: projectCount, heartbeatAge: age)
-            }
-            return .running(projectCount: projectCount, heartbeatAge: age)
-        } else {
-            if isStoppedByUser {
-                return .stopped(projectCount: projectCount)
-            }
-            return .failed(reason: "后台守护未运行", projectCount: projectCount)
-        }
+    private func updateButtonOffline() {
+        guard let button = statusItem.button else { return }
+        button.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: "ops error")
+        button.contentTintColor = .systemRed
+        button.title = " ops!"
     }
 
-    private func isLaunchdRunning() -> Bool {
-        let result = runCommand(executable: "/bin/launchctl", arguments: ["print", domainTarget])
-        guard result.exitCode == 0 else { return false }
-        return result.output.contains("state = running")
-    }
-
-    private func readHeartbeatAge() -> Int? {
-        guard let content = try? String(contentsOfFile: heartbeatFile, encoding: .utf8) else {
-            return nil
-        }
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let ts = Int(trimmed) else { return nil }
-        let now = Int(Date().timeIntervalSince1970)
-        return max(0, now - ts)
-    }
-
-    private func readProjects() -> [String] {
-        guard let content = try? String(contentsOfFile: projectsFile, encoding: .utf8) else {
-            return []
-        }
-        return content
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
-    }
-
-    private func applyNewState(_ newState: DaemonState) {
-        let inGrace = Date() < graceUntil
-        currentState = newState
-        updateStatusIcon(for: newState, inGracePeriod: inGrace)
-
-        switch newState {
-        case .failed(let reason, _):
-            if !inGrace && !hasNotifiedFailure {
-                hasNotifiedFailure = true
-                sendFailureNotification(reason: reason)
-            }
-        case .running, .paused, .stopped:
-            hasNotifiedFailure = false
-        }
-    }
-
-    // MARK: - Icon Rendering (Minimal SF Symbols, Red Only on Failure)
-
-    private func updateStatusIcon(for state: DaemonState, inGracePeriod: Bool) {
+    private func updateButton(with st: PresenceStatus) {
         guard let button = statusItem.button else { return }
 
-        switch state {
-        case .running:
-            button.image = makeTemplateSymbol(name: "bolt.circle.fill")
-            button.alphaValue = 1.0
-            button.toolTip = "ops 守护运行中"
+        if st.daemon_status == "FAILED" {
+            let img = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: "Daemon Failed")
+            img?.isTemplate = false
+            button.image = img
+            button.contentTintColor = .systemRed
+            button.title = " 异常"
+            return
+        }
 
-        case .paused:
-            button.image = makeTemplateSymbol(name: "pause.circle")
-            button.alphaValue = 0.55
-            button.toolTip = "ops 守护已暂停监听"
+        if st.daemon_status == "PAUSED" {
+            let img = NSImage(systemSymbolName: "pause.circle", accessibilityDescription: "Paused")
+            img?.isTemplate = true
+            button.image = img
+            button.contentTintColor = nil
+            button.title = " 暂停"
+            return
+        }
 
-        case .stopped:
-            button.image = makeTemplateSymbol(name: "circle.slash")
-            button.alphaValue = 0.50
-            button.toolTip = "ops 守护已手动停止"
+        if st.daemon_status == "STOPPED" {
+            let img = NSImage(systemSymbolName: "circle.slash", accessibilityDescription: "Stopped")
+            img?.isTemplate = true
+            button.image = img
+            button.contentTintColor = nil
+            button.title = " 停用"
+            return
+        }
 
-        case .failed(let reason, _):
-            if inGracePeriod {
-                button.image = makeTemplateSymbol(name: "bolt.circle")
-                button.alphaValue = 0.55
-                button.toolTip = "ops 正在检测状态..."
-            } else {
-                button.image = makeRedAlertSymbol(name: "exclamationmark.triangle.fill")
-                button.alphaValue = 1.0
-                button.toolTip = "ops 守护异常：\(reason)（点击恢复）"
-            }
+        // Daemon RUNNING -> 按当前在线/托管/自动模式展示
+        button.contentTintColor = nil
+        switch st.declared_mode {
+        case "online":
+            let img = NSImage(systemSymbolName: "person.fill", accessibilityDescription: "Online")
+            img?.isTemplate = true
+            button.image = img
+            button.title = " 在线"
+        case "away":
+            let img = NSImage(systemSymbolName: "bolt.circle.fill", accessibilityDescription: "Away Auto")
+            img?.isTemplate = true
+            button.image = img
+            button.title = " 托管"
+        default:
+            let img = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Smart Auto")
+            img?.isTemplate = true
+            button.image = img
+            button.title = " 自动"
         }
     }
 
-    private func makeTemplateSymbol(name: String) -> NSImage? {
-        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-        guard let img = NSImage(systemSymbolName: name, accessibilityDescription: "ops")?.withSymbolConfiguration(config) else {
-            return nil
-        }
-        img.isTemplate = true
-        return img
+    private func sendAlertNotification(title: String, body: String) {
+        let script = "display notification \"\(body)\" with title \"\(title)\""
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", script]
+        try? proc.run()
     }
 
-    private func makeRedAlertSymbol(name: String) -> NSImage? {
-        let sizeConfig = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
-        let colorConfig = NSImage.SymbolConfiguration(paletteColors: [.systemRed])
-        let combined = sizeConfig.applying(colorConfig)
-        guard let img = NSImage(systemSymbolName: name, accessibilityDescription: "ops 异常")?.withSymbolConfiguration(combined) else {
-            return nil
-        }
-        img.isTemplate = false
-        return img
-    }
+    // MARK: - NSMenuDelegate
 
-    // MARK: - Notifications (osascript for reliable unsigned local delivery)
-
-    private func sendFailureNotification(reason: String) {
-        workQueue.async { [weak self] in
-            guard let self = self else { return }
-            let escapedReason = reason
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-            let script = "display notification \"\(escapedReason)，点击顶栏图标可一键恢复\" with title \"ops 守护异常\""
-            _ = self.runCommand(executable: "/usr/bin/osascript", arguments: ["-e", script])
-        }
-    }
-
-    // MARK: - Menu Construction
-
-    func menuWillOpen(_ menu: NSMenu) {
-        rebuildMenu()
-        pollStatus()
-    }
-
-    private func rebuildMenu() {
+    func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        // Section 1: Status Header
-        let headerTitle: String
-        switch currentState {
-        case .running(let count, _):
-            headerTitle = "● 运行中 · 监听 \(count) 个项目"
-        case .paused(let count, _):
-            headerTitle = "⏸ 已暂停监听 · 监听 \(count) 个项目"
-        case .stopped:
-            headerTitle = "○ 已手动停止后台守护"
-        case .failed(let reason, _):
-            headerTitle = "▲ 守护异常 · \(reason)"
-        }
-        let headerItem = NSMenuItem(title: headerTitle, action: nil, keyEquivalent: "")
-        headerItem.isEnabled = false
-        menu.addItem(headerItem)
-        menu.addItem(NSMenuItem.separator())
-
-        // Section 2: Dynamic Daemon Controls
-        switch currentState {
-        case .failed, .stopped:
-            let startItem = NSMenuItem(title: "一键恢复并启动守护", action: #selector(startDaemon), keyEquivalent: "r")
-            startItem.target = self
-            menu.addItem(startItem)
-
-        case .running:
-            let pauseItem = NSMenuItem(title: "暂停监听", action: #selector(pauseDaemon), keyEquivalent: "p")
-            pauseItem.target = self
-            menu.addItem(pauseItem)
-
-            let restartItem = NSMenuItem(title: "重启守护", action: #selector(restartDaemon), keyEquivalent: "r")
-            restartItem.target = self
-            menu.addItem(restartItem)
-
-            let stopItem = NSMenuItem(title: "停止后台守护", action: #selector(stopDaemon), keyEquivalent: "")
-            stopItem.target = self
-            menu.addItem(stopItem)
-
-        case .paused:
-            let resumeItem = NSMenuItem(title: "恢复监听", action: #selector(resumeDaemon), keyEquivalent: "p")
-            resumeItem.target = self
-            menu.addItem(resumeItem)
-
-            let restartItem = NSMenuItem(title: "重启守护", action: #selector(restartDaemon), keyEquivalent: "r")
-            restartItem.target = self
-            menu.addItem(restartItem)
-
-            let stopItem = NSMenuItem(title: "停止后台守护", action: #selector(stopDaemon), keyEquivalent: "")
-            stopItem.target = self
-            menu.addItem(stopItem)
+        guard let st = currentStatus else {
+            let item = NSMenuItem(title: "正在读取 ops 状态…", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+            menu.addItem(.separator())
+            menu.addItem(makeActionItem("刷新状态", action: #selector(actionRefresh)))
+            menu.addItem(makeActionItem("退出顶栏图标", action: #selector(actionQuit)))
+            return
         }
 
-        menu.addItem(NSMenuItem.separator())
+        // 状态摘要
+        let modeDesc: String
+        switch st.declared_mode {
+        case "online": modeDesc = "人在线（手动优先）"
+        case "away": modeDesc = "人不在线（全自动托管）"
+        default: modeDesc = "智能自动（动态检测）"
+        }
+        let planDesc = st.effective_plan == "b" ? "方案 B（全自动）" : "方案 A（人工确认）"
+        let header1 = NSMenuItem(title: "模式: \(modeDesc) · 守护: \(st.daemon_status)", action: nil, keyEquivalent: "")
+        header1.isEnabled = false
+        menu.addItem(header1)
 
-        // Section 3: Projects, Logs & Quit
-        let projectsRoot = NSMenuItem(title: "监听项目 (\(currentProjects.count))", action: nil, keyEquivalent: "")
-        let projectsSubmenu = NSMenu()
-        if currentProjects.isEmpty {
-            let emptyItem = NSMenuItem(title: "暂无监听项目", action: nil, keyEquivalent: "")
-            emptyItem.isEnabled = false
-            projectsSubmenu.addItem(emptyItem)
+        let header2 = NSMenuItem(title: "当前策略: \(planDesc) · 空闲 \(st.idle_seconds)s", action: nil, keyEquivalent: "")
+        header2.isEnabled = false
+        menu.addItem(header2)
+
+        if !st.last_transition.isEmpty {
+            let transItem = NSMenuItem(title: "最近切换: \(st.last_transition)", action: nil, keyEquivalent: "")
+            transItem.isEnabled = false
+            menu.addItem(transItem)
+        }
+
+        menu.addItem(.separator())
+
+        // 显式模式切换
+        let onlineItem = makeActionItem("🟢 人在线（手动优先，超时自动接管）", action: #selector(actionSetOnline))
+        onlineItem.state = (st.declared_mode == "online") ? .on : .off
+        menu.addItem(onlineItem)
+
+        let awayItem = makeActionItem("🤖 人不在线（全自动托管，回来自动交接）", action: #selector(actionSetAway))
+        awayItem.state = (st.declared_mode == "away") ? .on : .off
+        menu.addItem(awayItem)
+
+        let autoItem = makeActionItem("⚡ 智能自动（按空闲阈值动态分流）", action: #selector(actionSetAuto))
+        autoItem.state = (st.declared_mode == "auto") ? .on : .off
+        menu.addItem(autoItem)
+
+        menu.addItem(.separator())
+
+        // 阈值动态配置子菜单
+        let thresholdRoot = NSMenuItem(title: "阈值设置（动态可调）", action: nil, keyEquivalent: "")
+        let thresholdMenu = NSMenu()
+
+        // 1) 在线超时兜底
+        let fallbackRoot = NSMenuItem(title: "在线超时兜底（当前 \(formatDuration(st.online_fallback_seconds))）", action: nil, keyEquivalent: "")
+        let fallbackMenu = NSMenu()
+        for mins in [1, 3, 5, 10, 15] {
+            let secs = mins * 60
+            let title = mins == 5 ? "\(mins) 分钟（默认）" : "\(mins) 分钟"
+            let item = makeActionItem(title, action: #selector(actionSetOnlineFallback(_:)))
+            item.tag = secs
+            item.state = (st.online_fallback_seconds == secs) ? .on : .off
+            fallbackMenu.addItem(item)
+        }
+        fallbackMenu.addItem(.separator())
+        fallbackMenu.addItem(makeActionItem("自定义输入（分钟）…", action: #selector(actionPromptOnlineFallback)))
+        fallbackRoot.submenu = fallbackMenu
+        thresholdMenu.addItem(fallbackRoot)
+
+        // 2) 离开防误触缓冲
+        let graceRoot = NSMenuItem(title: "离开防误触缓冲（当前 \(st.away_grace_seconds) 秒）", action: nil, keyEquivalent: "")
+        let graceMenu = NSMenu()
+        for secs in [15, 30, 60] {
+            let title = secs == 30 ? "\(secs) 秒（默认）" : "\(secs) 秒"
+            let item = makeActionItem(title, action: #selector(actionSetAwayGrace(_:)))
+            item.tag = secs
+            item.state = (st.away_grace_seconds == secs) ? .on : .off
+            graceMenu.addItem(item)
+        }
+        graceMenu.addItem(.separator())
+        graceMenu.addItem(makeActionItem("自定义输入（秒）…", action: #selector(actionPromptAwayGrace)))
+        graceRoot.submenu = graceMenu
+        thresholdMenu.addItem(graceRoot)
+
+        // 3) 智能自动空闲阈值
+        let autoIdleRoot = NSMenuItem(title: "智能自动空闲阈值（当前 \(st.auto_idle_seconds) 秒）", action: nil, keyEquivalent: "")
+        let autoIdleMenu = NSMenu()
+        for secs in [10, 15, 30, 60] {
+            let title = secs == 15 ? "\(secs) 秒（默认）" : "\(secs) 秒"
+            let item = makeActionItem(title, action: #selector(actionSetAutoIdle(_:)))
+            item.tag = secs
+            item.state = (st.auto_idle_seconds == secs) ? .on : .off
+            autoIdleMenu.addItem(item)
+        }
+        autoIdleMenu.addItem(.separator())
+        autoIdleMenu.addItem(makeActionItem("自定义输入（秒）…", action: #selector(actionPromptAutoIdle)))
+        autoIdleRoot.submenu = autoIdleMenu
+        thresholdMenu.addItem(autoIdleRoot)
+
+        thresholdRoot.submenu = thresholdMenu
+        menu.addItem(thresholdRoot)
+
+        menu.addItem(.separator())
+
+        // 后台守护控制
+        if st.daemon_status == "PAUSED" {
+            menu.addItem(makeActionItem("恢复后台监听", action: #selector(actionDaemonResume)))
+        } else if st.daemon_status == "RUNNING" {
+            menu.addItem(makeActionItem("暂停后台监听", action: #selector(actionDaemonPause)))
+        }
+
+        if st.daemon_status == "STOPPED" || st.daemon_status == "FAILED" {
+            menu.addItem(makeActionItem("启动 / 恢复后台守护", action: #selector(actionDaemonStart)))
         } else {
-            for path in currentProjects {
-                let name = URL(fileURLWithPath: path).lastPathComponent
-                let exists = FileManager.default.fileExists(atPath: path)
-                let label = exists ? name : "\(name) [目录不存在]"
-                let item = NSMenuItem(title: label, action: #selector(openProjectFolder(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = path
-                item.toolTip = path
-                item.isEnabled = exists
-                projectsSubmenu.addItem(item)
+            menu.addItem(makeActionItem("重启后台守护", action: #selector(actionDaemonRestart)))
+            menu.addItem(makeActionItem("停止后台守护", action: #selector(actionDaemonStop)))
+        }
+
+        menu.addItem(makeActionItem("查看守护日志", action: #selector(actionOpenLog)))
+        menu.addItem(.separator())
+        menu.addItem(makeActionItem("退出顶栏图标（守护继续运行）", action: #selector(actionQuit)))
+    }
+
+    private func makeActionItem(_ title: String, action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    private func formatDuration(_ seconds: Int) -> String {
+        if seconds >= 60 && seconds % 60 == 0 {
+            return "\(seconds / 60) 分钟"
+        }
+        return "\(seconds) 秒"
+    }
+
+    private func promptInteger(title: String, message: String, defaultValue: Int, minVal: Int) -> Int? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 160, height: 24))
+        input.stringValue = "\(defaultValue)"
+        alert.accessoryView = input
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            if let val = Int(input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), val >= minVal {
+                return val
             }
         }
-        projectsRoot.submenu = projectsSubmenu
-        menu.addItem(projectsRoot)
-
-        let logItem = NSMenuItem(title: "查看守护日志", action: #selector(openDaemonLog), keyEquivalent: "l")
-        logItem.target = self
-        menu.addItem(logItem)
-
-        let refreshItem = NSMenuItem(title: "立即刷新状态", action: #selector(manualRefresh), keyEquivalent: "")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let quitItem = NSMenuItem(title: "退出顶栏图标", action: #selector(quitApp), keyEquivalent: "q")
-        quitItem.target = self
-        quitItem.toolTip = "仅关闭顶栏图标，不影响后台 ops daemon 继续运行"
-        menu.addItem(quitItem)
+        return nil
     }
 
     // MARK: - Actions
 
-    @objc private func startDaemon() {
-        graceUntil = Date().addingTimeInterval(6)
-        hasNotifiedFailure = false
-        runOpsDaemonAction("start")
+    @objc private func actionSetOnline() {
+        runOps(["presence", "online"]) { [weak self] _, _ in self?.refreshStatus() }
     }
 
-    @objc private func restartDaemon() {
-        graceUntil = Date().addingTimeInterval(6)
-        hasNotifiedFailure = false
-        runOpsDaemonAction("restart")
+    @objc private func actionSetAway() {
+        runOps(["presence", "away"]) { [weak self] _, _ in self?.refreshStatus() }
     }
 
-    @objc private func pauseDaemon() {
-        runOpsDaemonAction("pause")
+    @objc private func actionSetAuto() {
+        runOps(["presence", "auto"]) { [weak self] _, _ in self?.refreshStatus() }
     }
 
-    @objc private func resumeDaemon() {
-        runOpsDaemonAction("resume")
+    @objc private func actionSetOnlineFallback(_ sender: NSMenuItem) {
+        runOps(["presence", "config", "--online-fallback", "\(sender.tag)"]) { [weak self] _, _ in self?.refreshStatus() }
     }
 
-    @objc private func stopDaemon() {
-        hasNotifiedFailure = false
-        runOpsDaemonAction("stop")
-    }
-
-    @objc private func manualRefresh() {
-        pollStatus()
-    }
-
-    @objc private func openProjectFolder(_ sender: NSMenuItem) {
-        guard let path = sender.representedObject as? String else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
-    }
-
-    @objc private func openDaemonLog() {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: logFile) {
-            NSWorkspace.shared.open(URL(fileURLWithPath: logFile))
-        } else if fm.fileExists(atPath: stateDir) {
-            NSWorkspace.shared.open(URL(fileURLWithPath: stateDir))
+    @objc private func actionPromptOnlineFallback() {
+        let curMins = max(1, (currentStatus?.online_fallback_seconds ?? 300) / 60)
+        if let mins = promptInteger(
+            title: "设置「在线超时兜底」",
+            message: "选了「人在线」但连续无人操作多少分钟后，自动切入全自动托管？（最小 1 分钟）",
+            defaultValue: curMins,
+            minVal: 1
+        ) {
+            runOps(["presence", "config", "--online-fallback", "\(mins * 60)"]) { [weak self] _, _ in self?.refreshStatus() }
         }
     }
 
-    @objc private func quitApp() {
+    @objc private func actionSetAwayGrace(_ sender: NSMenuItem) {
+        runOps(["presence", "config", "--away-grace", "\(sender.tag)"]) { [weak self] _, _ in self?.refreshStatus() }
+    }
+
+    @objc private func actionPromptAwayGrace() {
+        let cur = currentStatus?.away_grace_seconds ?? 30
+        if let secs = promptInteger(
+            title: "设置「离开防误触缓冲」",
+            message: "点击「人不在线」后多少秒内忽略键鼠操作，防止离开瞬间误触发回切？（最小 5 秒）",
+            defaultValue: cur,
+            minVal: 5
+        ) {
+            runOps(["presence", "config", "--away-grace", "\(secs)"]) { [weak self] _, _ in self?.refreshStatus() }
+        }
+    }
+
+    @objc private func actionSetAutoIdle(_ sender: NSMenuItem) {
+        runOps(["presence", "config", "--auto-idle", "\(sender.tag)"]) { [weak self] _, _ in self?.refreshStatus() }
+    }
+
+    @objc private func actionPromptAutoIdle() {
+        let cur = currentStatus?.auto_idle_seconds ?? 15
+        if let secs = promptInteger(
+            title: "设置「智能自动空闲阈值」",
+            message: "智能自动模式下，键鼠空闲多少秒后允许自动走方案 B？（最小 5 秒）",
+            defaultValue: cur,
+            minVal: 5
+        ) {
+            runOps(["presence", "config", "--auto-idle", "\(secs)"]) { [weak self] _, _ in self?.refreshStatus() }
+        }
+    }
+
+    @objc private func actionDaemonPause() {
+        runOps(["daemon", "pause"]) { [weak self] _, _ in self?.refreshStatus() }
+    }
+
+    @objc private func actionDaemonResume() {
+        runOps(["daemon", "resume"]) { [weak self] _, _ in self?.refreshStatus() }
+    }
+
+    @objc private func actionDaemonStart() {
+        runOps(["daemon", "start"]) { [weak self] _, _ in self?.refreshStatus() }
+    }
+
+    @objc private func actionDaemonRestart() {
+        runOps(["daemon", "restart"]) { [weak self] _, _ in self?.refreshStatus() }
+    }
+
+    @objc private func actionDaemonStop() {
+        runOps(["daemon", "stop"]) { [weak self] _, _ in self?.refreshStatus() }
+    }
+
+    @objc private func actionOpenLog() {
+        if !FileManager.default.fileExists(atPath: daemonLogPath) {
+            FileManager.default.createFile(atPath: daemonLogPath, contents: nil)
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: daemonLogPath))
+    }
+
+    @objc private func actionRefresh() {
+        refreshStatus()
+    }
+
+    @objc private func actionQuit() {
         NSApp.terminate(nil)
-    }
-
-    private func runOpsDaemonAction(_ subcommand: String) {
-        workQueue.async { [weak self] in
-            guard let self = self else { return }
-            _ = self.runCommand(
-                executable: "/bin/bash",
-                arguments: [self.opsBinPath, "daemon", subcommand]
-            )
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                self?.pollStatus()
-            }
-        }
-    }
-
-    private func runCommand(executable: String, arguments: [String]) -> (exitCode: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-
-        var env = ProcessInfo.processInfo.environment
-        env["HOME"] = homeDir
-        env["PATH"] = "\(homeDir)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        process.environment = env
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let out = String(data: data, encoding: .utf8) ?? ""
-            return (process.terminationStatus, out)
-        } catch {
-            return (-1, error.localizedDescription)
-        }
     }
 }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+let controller = OpsMenuBarController()
+app.delegate = nil
+withExtendedLifetime(controller) {
+    app.run()
+}

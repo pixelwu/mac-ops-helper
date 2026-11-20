@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-OPS_VERSION="1.3.0"
+OPS_VERSION="1.4.0"
 DAEMON_LABEL="com.user.ops-watch"
 DAEMON_PROJECTS_FILE="$HOME/.ops-watch-projects"
 DAEMON_PLIST_NAME="com.user.ops-watch.plist"
@@ -13,6 +13,7 @@ DAEMON_STATE_DIR="$HOME/.local/state/ops"
 DAEMON_HEARTBEAT_FILE="${DAEMON_STATE_DIR}/heartbeat"
 DAEMON_PAUSED_FILE="${DAEMON_STATE_DIR}/paused"
 DAEMON_STOPPED_FILE="${DAEMON_STATE_DIR}/stopped_by_user"
+PRESENCE_FILE="${DAEMON_STATE_DIR}/presence.json"
 CONFIG_FILE_NAME=".ops.json"
 SYNC_DIR_NAME=".sync"
 
@@ -133,6 +134,7 @@ ops v${OPS_VERSION} - 轻量级全局人机协同运维命令行工具
   agy [选项] [文件]   派发 .sync/agy_prompt.md 给 Antigravity 桌面端（方案 B 优先，自动降级方案 A）
   watch [选项]        监听 .sync/agy_prompt.md 变化并按键鼠空闲时间自动分流方案 B / 方案 A
   daemon <子命令>     管理多项目开机自启后台守护 (install/uninstall/start/stop/restart/pause/resume/status/add/remove/list/run)
+  presence <子命令>   管理人机在线状态、双向兜底阈值与中途交接检查 (online/away/auto/status/check/config)
   rollback            执行 rollback_cmd 回滚 -> 自动执行 ops verify
   clean               一键删除当前项目的 .sync/ 目录
   help, -h, --help    显示本帮助信息
@@ -661,6 +663,366 @@ send_mac_notification() {
   osascript -e "display notification \"${e_msg}\" with title \"${e_title}\" subtitle \"${e_sub}\"" >/dev/null 2>&1 || true
 }
 
+# 辅助函数：计算后台守护当前综合状态（供 daemon status 与 presence status --json 共享）
+DAEMON_SUMMARY_CODE="FAILED"
+DAEMON_HB_AGE=-1
+daemon_compute_state() {
+  local uid_num domain_target print_out="" is_running="false"
+  uid_num="$(id -u)"
+  domain_target="gui/${uid_num}/${DAEMON_LABEL}"
+  DAEMON_SUMMARY_CODE="FAILED"
+  DAEMON_HB_AGE=-1
+
+  if print_out="$(launchctl print "${domain_target}" 2>/dev/null)"; then
+    if printf "%s\n" "${print_out}" | grep -q 'state = running'; then
+      is_running="true"
+    fi
+  fi
+
+  if [ -f "${DAEMON_HEARTBEAT_FILE}" ]; then
+    local hb_ts now_ts
+    hb_ts="$(cat "${DAEMON_HEARTBEAT_FILE}" 2>/dev/null || true)"
+    now_ts="$(date +%s)"
+    case "${hb_ts}" in
+      ''|*[!0-9]*) DAEMON_HB_AGE=-1 ;;
+      *)
+        DAEMON_HB_AGE=$((now_ts - hb_ts))
+        [ "${DAEMON_HB_AGE}" -lt 0 ] && DAEMON_HB_AGE=0
+        ;;
+    esac
+  fi
+
+  if [ "${is_running}" = "true" ]; then
+    if [ "${DAEMON_HB_AGE}" -ge 0 ] && [ "${DAEMON_HB_AGE}" -le 15 ]; then
+      if [ -f "${DAEMON_PAUSED_FILE}" ]; then
+        DAEMON_SUMMARY_CODE="PAUSED"
+      else
+        DAEMON_SUMMARY_CODE="RUNNING"
+      fi
+    else
+      DAEMON_SUMMARY_CODE="FAILED"
+    fi
+  else
+    if [ -f "${DAEMON_STOPPED_FILE}" ]; then
+      DAEMON_SUMMARY_CODE="STOPPED"
+    else
+      DAEMON_SUMMARY_CODE="FAILED"
+    fi
+  fi
+}
+
+# 7.5 ops presence - 显式在线/不在线状态机、双向兜底与中途归来检查点
+P_MODE="auto"
+P_SET_AT=0
+P_ONLINE_FALLBACK=300
+P_AWAY_GRACE=30
+P_AUTO_IDLE=15
+P_LAST_TRANSITION=""
+P_HANDOFF_REQ="false"
+
+presence_write_json() {
+  local mode="$1"
+  local set_at="$2"
+  local online_fb="$3"
+  local away_grace="$4"
+  local auto_idle="$5"
+  local last_trans="$6"
+  local handoff_req="$7"
+
+  mkdir -p "${DAEMON_STATE_DIR}"
+  local tmp_file
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/ops_presence.XXXXXX")"
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -n \
+      --arg mode "${mode}" \
+      --argjson set_at "${set_at}" \
+      --argjson online_fb "${online_fb}" \
+      --argjson away_grace "${away_grace}" \
+      --argjson auto_idle "${auto_idle}" \
+      --arg last_trans "${last_trans}" \
+      --argjson handoff_req "${handoff_req}" \
+      '{
+        mode: $mode,
+        set_at: $set_at,
+        online_fallback_seconds: $online_fb,
+        away_grace_seconds: $away_grace,
+        auto_idle_seconds: $auto_idle,
+        last_transition: $last_trans,
+        handoff_requested: $handoff_req
+      }' > "${tmp_file}"
+  else
+    local esc_trans
+    esc_trans="$(printf '%s' "${last_trans}" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    cat > "${tmp_file}" <<EOF
+{
+  "mode": "${mode}",
+  "set_at": ${set_at},
+  "online_fallback_seconds": ${online_fb},
+  "away_grace_seconds": ${away_grace},
+  "auto_idle_seconds": ${auto_idle},
+  "last_transition": "${esc_trans}",
+  "handoff_requested": ${handoff_req}
+}
+EOF
+  fi
+
+  cat "${tmp_file}" > "${PRESENCE_FILE}"
+  rm -f "${tmp_file}"
+}
+
+presence_init_file() {
+  mkdir -p "${DAEMON_STATE_DIR}"
+  if [ ! -s "${PRESENCE_FILE}" ]; then
+    presence_write_json "auto" "$(date +%s)" 300 30 15 "" "false"
+    return 0
+  fi
+  if command -v jq >/dev/null 2>&1 && ! jq empty "${PRESENCE_FILE}" >/dev/null 2>&1; then
+    presence_write_json "auto" "$(date +%s)" 300 30 15 "状态文件重置" "false"
+  fi
+}
+
+presence_read_fields() {
+  presence_init_file
+  P_MODE="auto"
+  P_SET_AT=0
+  P_ONLINE_FALLBACK=300
+  P_AWAY_GRACE=30
+  P_AUTO_IDLE=15
+  P_LAST_TRANSITION=""
+  P_HANDOFF_REQ="false"
+
+  if command -v jq >/dev/null 2>&1 && jq empty "${PRESENCE_FILE}" >/dev/null 2>&1; then
+    local v
+    v="$(jq -r '.mode // "auto"' "${PRESENCE_FILE}")"
+    case "${v}" in
+      online|away|auto) P_MODE="${v}" ;;
+      *) P_MODE="auto" ;;
+    esac
+    v="$(jq -r '.set_at // 0' "${PRESENCE_FILE}")"
+    case "${v}" in ''|*[!0-9]*) P_SET_AT=0 ;; *) P_SET_AT="${v}" ;; esac
+    v="$(jq -r '.online_fallback_seconds // 300' "${PRESENCE_FILE}")"
+    case "${v}" in ''|*[!0-9]*|0) P_ONLINE_FALLBACK=300 ;; *) P_ONLINE_FALLBACK="${v}" ;; esac
+    v="$(jq -r '.away_grace_seconds // 30' "${PRESENCE_FILE}")"
+    case "${v}" in ''|*[!0-9]*) P_AWAY_GRACE=30 ;; *) P_AWAY_GRACE="${v}" ;; esac
+    v="$(jq -r '.auto_idle_seconds // 15' "${PRESENCE_FILE}")"
+    case "${v}" in ''|*[!0-9]*|0) P_AUTO_IDLE=15 ;; *) P_AUTO_IDLE="${v}" ;; esac
+    P_LAST_TRANSITION="$(jq -r '.last_transition // ""' "${PRESENCE_FILE}")"
+    v="$(jq -r 'if .handoff_requested == true then "true" else "false" end' "${PRESENCE_FILE}")"
+    P_HANDOFF_REQ="${v}"
+  fi
+}
+
+EVAL_DECLARED_MODE="auto"
+EVAL_EFFECTIVE_MODE="online"
+EVAL_EFFECTIVE_PLAN="a"
+EVAL_REASON=""
+EVAL_IDLE_SEC=0
+
+presence_evaluate() {
+  local persist="${1:-false}"
+  presence_read_fields
+
+  local idle_sec now_ts locked="false"
+  idle_sec="$(get_idle_seconds)"
+  now_ts="$(date +%s)"
+  if is_screen_locked; then
+    locked="true"
+  fi
+
+  EVAL_DECLARED_MODE="${P_MODE}"
+  EVAL_IDLE_SEC="${idle_sec}"
+
+  if [ "${P_MODE}" = "online" ]; then
+    if [ "${idle_sec}" -ge "${P_ONLINE_FALLBACK}" ]; then
+      EVAL_EFFECTIVE_MODE="away"
+      EVAL_EFFECTIVE_PLAN="b"
+      EVAL_REASON="在线模式连续空闲 ${idle_sec}s >= 兜底阈值 ${P_ONLINE_FALLBACK}s，已自动转全自动托管"
+      if [ "${persist}" = "true" ]; then
+        local trans="在线超时(${P_ONLINE_FALLBACK}s) -> 自动托管"
+        presence_write_json "away" "${now_ts}" "${P_ONLINE_FALLBACK}" "${P_AWAY_GRACE}" "${P_AUTO_IDLE}" "${trans}" "false"
+        P_MODE="away"
+        P_LAST_TRANSITION="${trans}"
+        P_HANDOFF_REQ="false"
+        EVAL_DECLARED_MODE="away"
+        send_mac_notification "ops 自动兜底切换" "已转入全自动托管" "检测到你离开超过 ${P_ONLINE_FALLBACK} 秒，后续任务将自动由 Antigravity 执行"
+      fi
+    else
+      EVAL_EFFECTIVE_MODE="online"
+      EVAL_EFFECTIVE_PLAN="a"
+      EVAL_REASON="当前为「人在线」模式（空闲 ${idle_sec}s < 兜底阈值 ${P_ONLINE_FALLBACK}s）"
+    fi
+  elif [ "${P_MODE}" = "away" ]; then
+    local elapsed=$((now_ts - P_SET_AT))
+    [ "${elapsed}" -lt 0 ] && elapsed=0
+    if [ "${elapsed}" -gt "${P_AWAY_GRACE}" ] && [ "${idle_sec}" -lt 10 ] && [ "${locked}" != "true" ]; then
+      EVAL_EFFECTIVE_MODE="online"
+      EVAL_EFFECTIVE_PLAN="a"
+      EVAL_REASON="离开缓冲期(${P_AWAY_GRACE}s)后检测到键鼠操作（空闲 ${idle_sec}s），自动切回人在线并交接"
+      if [ "${persist}" = "true" ]; then
+        local trans="检测到操作电脑 -> 自动交接在线"
+        presence_write_json "online" "${now_ts}" "${P_ONLINE_FALLBACK}" "${P_AWAY_GRACE}" "${P_AUTO_IDLE}" "${trans}" "true"
+        P_MODE="online"
+        P_LAST_TRANSITION="${trans}"
+        P_HANDOFF_REQ="true"
+        EVAL_DECLARED_MODE="online"
+        send_mac_notification "ops 检测到你已回来" "已自动切回「人在线」模式" "如 Antigravity 正在跑后台步骤，将在检查点保留有效进度并交接给你"
+      fi
+    else
+      EVAL_EFFECTIVE_MODE="away"
+      EVAL_EFFECTIVE_PLAN="b"
+      EVAL_REASON="当前为「人不在线」全自动托管模式（已设 ${elapsed}s，空闲 ${idle_sec}s）"
+    fi
+  else
+    if [ "${idle_sec}" -lt "${P_AUTO_IDLE}" ]; then
+      EVAL_EFFECTIVE_MODE="online"
+      EVAL_EFFECTIVE_PLAN="a"
+      EVAL_REASON="智能自动模式：检测到你正在操作电脑（空闲 ${idle_sec}s < 阈值 ${P_AUTO_IDLE}s）"
+    else
+      EVAL_EFFECTIVE_MODE="away"
+      EVAL_EFFECTIVE_PLAN="b"
+      EVAL_REASON="智能自动模式：键鼠空闲 ${idle_sec}s >= 阈值 ${P_AUTO_IDLE}s，允许方案 B"
+    fi
+  fi
+}
+
+cmd_presence() {
+  local action="${1:-status}"
+  shift || true
+
+  case "${action}" in
+    online|away|auto)
+      presence_read_fields
+      local now_ts trans_label
+      now_ts="$(date +%s)"
+      case "${action}" in
+        online) trans_label="手动切换 -> 人在线" ;;
+        away)   trans_label="手动切换 -> 人不在线(托管)" ;;
+        auto)   trans_label="手动切换 -> 智能自动" ;;
+      esac
+      presence_write_json "${action}" "${now_ts}" "${P_ONLINE_FALLBACK}" "${P_AWAY_GRACE}" "${P_AUTO_IDLE}" "${trans_label}" "false"
+      log_ok "已切换状态: ${trans_label}"
+      if [ "${action}" = "away" ]; then
+        log_info "离开防误触缓冲期 ${P_AWAY_GRACE}s：超过缓冲期后只要你操作键鼠就会自动切回人在线。"
+      elif [ "${action}" = "online" ]; then
+        log_info "在线兜底阈值 ${P_ONLINE_FALLBACK}s：若连续无人操作超过该时长将自动转托管。"
+      fi
+      ;;
+    config)
+      presence_read_fields
+      local new_fb="${P_ONLINE_FALLBACK}" new_grace="${P_AWAY_GRACE}" new_auto="${P_AUTO_IDLE}"
+      local changed="false"
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --online-fallback)
+            case "${2:-}" in
+              ''|*[!0-9]*|0) log_err "--online-fallback 必须为正整数（秒）"; exit 1 ;;
+              *) new_fb="$2"; changed="true"; shift 2 ;;
+            esac
+            ;;
+          --away-grace)
+            case "${2:-}" in
+              ''|*[!0-9]*) log_err "--away-grace 必须为非负整数（秒）"; exit 1 ;;
+              *) new_grace="$2"; changed="true"; shift 2 ;;
+            esac
+            ;;
+          --auto-idle)
+            case "${2:-}" in
+              ''|*[!0-9]*|0) log_err "--auto-idle 必须为正整数（秒）"; exit 1 ;;
+              *) new_auto="$2"; changed="true"; shift 2 ;;
+            esac
+            ;;
+          *)
+            log_err "未知 config 参数: $1"; exit 1 ;;
+        esac
+      done
+      if [ "${changed}" = "true" ]; then
+        presence_write_json "${P_MODE}" "${P_SET_AT}" "${new_fb}" "${new_grace}" "${new_auto}" "${P_LAST_TRANSITION}" "${P_HANDOFF_REQ}"
+        log_ok "已更新阈值: 在线兜底=${new_fb}s | 离开缓冲=${new_grace}s | 自动空闲=${new_auto}s"
+      else
+        log_info "当前阈值: 在线兜底=${P_ONLINE_FALLBACK}s | 离开缓冲=${P_AWAY_GRACE}s | 自动空闲=${P_AUTO_IDLE}s"
+      fi
+      ;;
+    check)
+      # 供 Antigravity 每步执行前调用：返回 0 (AWAY) 可继续自动执行；返回 2 (ONLINE) 表示人已回来，应立即停手整理有效保留/无效丢弃并交接
+      presence_evaluate "true"
+      if [ "${EVAL_EFFECTIVE_MODE}" = "online" ]; then
+        printf "ONLINE\n"
+        return 2
+      else
+        printf "AWAY\n"
+        return 0
+      fi
+      ;;
+    status)
+      local as_json="false"
+      if [ "${1:-}" = "--json" ]; then
+        as_json="true"
+      fi
+      presence_evaluate "false"
+      daemon_compute_state
+      if [ "${as_json}" = "true" ]; then
+        require_cmd jq "输出 JSON 状态需要 jq"
+        jq -n \
+          --arg declared_mode "${EVAL_DECLARED_MODE}" \
+          --arg effective_mode "${EVAL_EFFECTIVE_MODE}" \
+          --arg effective_plan "${EVAL_EFFECTIVE_PLAN}" \
+          --argjson idle_seconds "${EVAL_IDLE_SEC}" \
+          --argjson online_fallback_seconds "${P_ONLINE_FALLBACK}" \
+          --argjson away_grace_seconds "${P_AWAY_GRACE}" \
+          --argjson auto_idle_seconds "${P_AUTO_IDLE}" \
+          --arg reason "${EVAL_REASON}" \
+          --arg last_transition "${P_LAST_TRANSITION}" \
+          --argjson handoff_requested "${P_HANDOFF_REQ}" \
+          --arg daemon_status "${DAEMON_SUMMARY_CODE}" \
+          --argjson heartbeat_age "${DAEMON_HB_AGE}" \
+          '{
+            declared_mode: $declared_mode,
+            effective_mode: $effective_mode,
+            effective_plan: $effective_plan,
+            idle_seconds: $idle_seconds,
+            online_fallback_seconds: $online_fallback_seconds,
+            away_grace_seconds: $away_grace_seconds,
+            auto_idle_seconds: $auto_idle_seconds,
+            reason: $reason,
+            last_transition: $last_transition,
+            handoff_requested: $handoff_requested,
+            daemon_status: $daemon_status,
+            heartbeat_age: $heartbeat_age
+          }'
+      else
+        log_info "声明模式: ${EVAL_DECLARED_MODE} | 生效状态: ${EVAL_EFFECTIVE_MODE} (方案 $(printf '%s' "${EVAL_EFFECTIVE_PLAN}" | tr '[:lower:]' '[:upper:]'))"
+        log_info "判定说明: ${EVAL_REASON}"
+        log_info "阈值配置: 在线兜底=${P_ONLINE_FALLBACK}s | 离开缓冲=${P_AWAY_GRACE}s | 自动空闲=${P_AUTO_IDLE}s"
+        log_info "后台守护: ${DAEMON_SUMMARY_CODE} | 状态文件: ${PRESENCE_FILE}"
+        if [ -n "${P_LAST_TRANSITION}" ]; then
+          log_info "最近切换: ${P_LAST_TRANSITION}"
+        fi
+      fi
+      ;;
+    help|-h|--help)
+      cat <<EOF
+用法: ops presence <subcommand> [options]
+
+子命令:
+  online                          声明「人在线」（手动优先方案 A，超时无人自动兜底转方案 B）
+  away                            声明「人不在线」（全自动方案 B，缓冲期后操作键鼠自动切回在线）
+  auto                            声明「智能自动」（按空闲阈值动态分流）
+  status [--json]                 查看当前在线状态、双向兜底阈值与守护综合状态
+  check                           供 Antigravity 步间检查：AWAY(exit 0) 继续自动，ONLINE(exit 2) 立即停手交接
+  config [选项]                   动态调整阈值:
+    --online-fallback <秒>        在线模式无人操作自动转托管的超时秒数（默认 300）
+    --away-grace <秒>             点击不在线后的防误触缓冲秒数（默认 30）
+    --auto-idle <秒>              智能自动模式空闲判定秒数（默认 15）
+EOF
+      ;;
+    *)
+      log_err "未知 presence 子命令: ${action}"
+      exit 1
+      ;;
+  esac
+}
+
 # 8. ops agy - 向 Antigravity 桌面端派发提示词（方案 B 优先，忙碌/异常自动降级方案 A）
 cmd_agy() {
   require_cmd pbcopy "macOS 默认自带 pbcopy"
@@ -791,9 +1153,14 @@ EOF
     elif is_screen_locked; then
       selected_plan="a"
       fallback_reason="检测到屏幕处于锁定状态"
-    elif [ "$from_watch" = "true" ] && [ "$idle_sec" -lt "$idle_threshold" ]; then
-      selected_plan="a"
-      fallback_reason="检测到你正在操作电脑（空闲 ${idle_sec}s < 阈值 ${idle_threshold}s），避免抢焦点"
+    elif [ "$from_watch" = "true" ]; then
+      presence_evaluate "true"
+      if [ "${EVAL_EFFECTIVE_PLAN}" = "a" ]; then
+        selected_plan="a"
+        fallback_reason="${EVAL_REASON}"
+      else
+        selected_plan="b"
+      fi
     else
       selected_plan="b"
     fi
@@ -1227,6 +1594,7 @@ daemon_run() {
 
   while true; do
     date +%s > "${DAEMON_HEARTBEAT_FILE}"
+    presence_evaluate "true" >/dev/null 2>&1 || true
     if [ -f "${DAEMON_PAUSED_FILE}" ]; then
       sleep "${interval}"
       continue
@@ -1316,6 +1684,7 @@ main() {
     agy)      cmd_agy "$@" ;;
     watch)    cmd_watch "$@" ;;
     daemon)   cmd_daemon "$@" ;;
+    presence) cmd_presence "$@" ;;
     rollback) cmd_rollback "$@" ;;
     clean)    cmd_clean "$@" ;;
     help|-h|--help)

@@ -69,6 +69,7 @@ ops --help
 | `ops agy [--mode auto\|a\|b]` | 向 Antigravity 桌面端派发 `.sync/agy_prompt.md` | 默认方案 B（唤起 → 焦点核验 → `⌘+L` → `⌘+V` → 回车 → 截屏）；异常或标记为 A 时自动降级方案 A |
 | `ops watch [--idle 15]` | 前台监听单项目 `.sync/agy_prompt.md` 变化 | 键鼠空闲 ≥ 15 秒且未锁屏自动走方案 B；人在操作电脑时自动降级方案 A（不抢焦点，仅复制+通知） |
 | `ops daemon <子命令>` | 多项目开机自启后台守护（`launchd`） | 支持 `install` / `uninstall` / `start` / `stop` / `restart` / `pause` / `resume` / `status` / `add` / `remove` / `list` |
+| `ops presence <子命令>` | 显式在线/托管状态机与双向兜底 | 支持 `online` / `away` / `auto` / `status [--json]` / `check`（步间交接检查点）/ `config`（动态调阈值） |
 | `ops rollback` | 回滚变更并自动验收 | 执行 `rollback_cmd` → 自动触发 `ops verify` |
 | `ops clean` | 一键清理项目同步目录 | 删除当前项目的 `.sync/` 目录 |
 | `ops --help` / `ops -v` | 查看帮助与版本 | 输出命令说明或版本号 |
@@ -174,10 +175,15 @@ backups/
 
 ## 7. 给 AI 助手的协作约定（AI Quick Guide）
 
-当你在包含 `.ops.json` 的项目中与人类及 Antigravity（Turbo 模式）协作时：
-- **分工原则（最少打扰）**：总控 AI 负责方案设计、核心把关与最终验收（尽量少跑零碎终端命令）；批量建文件、装依赖、跑测试与桌面点击交给 Antigravity 桌面端 Turbo 模式一口气执行。
-- **先看现场**：优先读取 `.sync/agy_log.md`（执行与问题记录）、`.sync/in/`（配置与采样日志）、`.sync/report.txt`（真实宿主机探测输出）和 `.sync/screen.png`（界面截图）；内容缺失或过旧时提示人类运行对应 `ops` 命令。
-- **Antigravity 桌面端派发（B 优先 / A 兜底）**：需要施工或界面操作时，将任务提示词写入 `.sync/agy_prompt.md`，并在回复开头明确告知本轮建议走 **方案 B** 还是 **方案 A**；高风险操作在文件第一行写 `<!-- ops-mode: A -->`（工具复制时会自动剥离）。
-- **强制问题留痕（`.sync/agy_log.md`）**：每次发给 Antigravity 的任务书末尾必须要求它无论成功或受阻，都将本次执行结果覆盖写入 `.sync/agy_log.md`，包含：执行状态（`SUCCESS` / `PARTIAL` / `BLOCKED`）、改动清单、**真实环境遇到的每个问题（原始报错、根因、尝试过的修复与结果、遗留阻塞项）**，以及是否已完成 `ops verify` / `ops capture`。
+当你在包含 `.ops.json` 的项目中与人类及 Antigravity（Turbo 模式 / 轻量 Flash 模型）协作时：
+- **核心分工（主力强模型写代码，Antigravity 只做机械跑腿）**：主力强模型负责需求拆解、架构设计、所有核心代码编写与多文件修改、静态自检、根因分析、精确补丁编写及最终验收，并尽量减少碎步终端命令弹窗打断人类；Antigravity 桌面端（Turbo 模式 / Flash 模型）**严禁外包核心业务代码编写、多文件重构或复杂 Bug 修复**，仅作为宿主机机械执行器，承接沙盒不便直接执行的机械步骤（`git pull/push`、安装依赖、宿主机编译、执行已写好的部署/测试命令、跨隐藏目录操作、UI 点击及收集原始输出）。始终走桌面端（`.sync/agy_prompt.md` / `ops agy` / `ops watch` / `ops daemon`），不走 Antigravity CLI。
+- **先看现场**：每次验收或排障前，优先读取 `.sync/agy_log.md`（执行与报错记录）、`.sync/report.txt`（真实宿主机探测输出）、`.sync/screen.png`（界面截图）和 `.sync/in/`（配置与采样日志）；内容缺失或过旧时提示人类运行对应 `ops` 命令。
+- **模式提前告知与高风险刹车（B 优先 / A 兜底）**：每次生成 `.sync/agy_prompt.md` 时，必须在回复最开头明确告知本轮建议走 **方案 B（全自动派发）** 还是 **方案 A（人工确认）**；凡涉及删除重要数据、修改系统核心配置/开机自启项、线上发布或账号敏感操作，必须在文件第一行写入 `<!-- ops-mode: A -->`（工具复制时会自动剥离）并在回复开头提醒人类人工确认。
+- **在线状态步间交接（`HANDOFF_TO_HUMAN`）**：多步骤后台任务需将步骤标注为 `[AUTO]` 或 `[HUMAN]`，要求 Antigravity 在每步（尤其是 `[HUMAN]` 步骤）前运行 `ops presence check`；若返回 `ONLINE`（退出码 `2`），立即暂停后续步骤，保留已验证完成的改动、回滚半成品，并以 `HANDOFF_TO_HUMAN` 状态写入 `.sync/agy_log.md`。
+- **遇错即停 + 强制留痕（`.sync/agy_log.md`）**：每份 `.sync/agy_prompt.md` 末尾必须强制要求：遇到任何编译、脚本或系统报错时，**严禁 Antigravity 自行修改核心代码或自由发挥**，应立即停止并将原始完整报错交回主力模型处理；无论结果如何，均覆盖写入 `.sync/agy_log.md`，固定包含四部分：
+  1. **执行状态与时间**：`SUCCESS` / `PARTIAL` / `BLOCKED` / `HANDOFF_TO_HUMAN`
+  2. **改动与命令清单**：涉及文件、Commit Hash 及执行过的关键命令
+  3. **真实环境遇到的问题与原始报错**：写清「现象与原始完整报错片段 → 当前阻塞点」（若为 `HANDOFF_TO_HUMAN`，同步列明已保留/已回滚/剩余步骤）
+  4. **验收产物状态**：是否已完成 `ops verify`（`.sync/report.txt`）及按需 `ops capture`（`.sync/screen.png`）
 - **不直接改宿主机隐私路径**：将配置改动落在项目仓库中，由人类确认后执行 `ops apply` 发布并自动验收；若验收失败，由人类执行 `ops rollback` 回滚。
 - **收尾清理**：排障完成后可提醒人类执行 `ops clean` 一键清空 `.sync/`。
