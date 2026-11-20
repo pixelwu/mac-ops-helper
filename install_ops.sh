@@ -31,5 +31,5 @@ if ! echo ":$PATH:" | grep -q ":$BIN_DIR:"; then
     fi
     echo "👉 请运行一次: source ~/.zshrc   (或新开终端窗口后即可直接使用 ops 命令)"
 else
-    echo "✓ PATH 已包含 $BIN_DIR，现在可直接运行 ops help 验证。"
+    echo "✓ PATH 已包含 ${BIN_DIR}，现在可直接运行 ops help 验证。"
 fi

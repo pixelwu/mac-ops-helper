@@ -15,6 +15,9 @@
   "backup_dir": "~/.my-service/backups",
   "keep_backups": 3,
   "capture_app": "Terminal",
+  "agy_app": "Antigravity",
+  "agy_idle_seconds": 15,
+  "agy_focus_key": "l",
   "verify_cmds": [
     "echo 'Service health check OK'"
   ]

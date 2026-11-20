@@ -7,6 +7,7 @@ Icon
 # ops-helper runtime & sync directories
 .sync/
 .ops.json
+config.json
 backups/
 
 # Logs & temp files
