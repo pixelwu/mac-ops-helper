@@ -1,0 +1,21 @@
+{
+  "project": "my-mac-service",
+  "pull": [
+    {
+      "src": "~/.my-service",
+      "dest": "my-service",
+      "exclude": ["bin", "logs", "backups", "*.db", "*.log", "config.json"]
+    }
+  ],
+  "logs": [
+    { "path": "~/.my-service/logs/app.log", "lines": 100 }
+  ],
+  "deploy_cmd": "bash ./deploy.sh",
+  "rollback_cmd": "bash ./rollback.sh",
+  "backup_dir": "~/.my-service/backups",
+  "keep_backups": 3,
+  "capture_app": "Terminal",
+  "verify_cmds": [
+    "echo 'Service health check OK'"
+  ]
+}

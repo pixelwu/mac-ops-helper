@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# ops-helper runtime & sync directories
+.sync/
+.ops.json
+backups/
+
+# Logs & temp files
+*.log
+*.tmp
+*.swp
+*~
+
+# IDE & editors
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
